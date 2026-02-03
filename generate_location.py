@@ -8,7 +8,7 @@ from radarloc_generator.geocoding import geocode
 from radarloc_generator.coordinate_transform import nm_to_meters
 from radarloc_generator.osm_query import query_water_features
 from radarloc_generator.elevation import query_elevation_grid
-from radarloc_generator.radarloc_builder import build_radarloc, save_radarloc
+from radarloc_generator.radarloc_builder import build_radarloc, save_radarloc, validate_radarloc
 
 
 def parse_coordinates(text: str):
@@ -79,15 +79,38 @@ def main():
         safe_name = re.sub(r"[^\w\-]", "_", args.location.split(",")[0].strip().lower())
         output = f"{safe_name}.radarloc"
 
+    # Validate before saving
+    validation = validate_radarloc(doc)
+
     save_radarloc(doc, output)
     print(f"Saved: {output}")
 
-    # Summary
-    total_points = sum(len(c["points"]) for c in coastlines)
-    print(f"  Coastlines: {len(coastlines)} features, {total_points} points")
+    # Summary with quality metrics
+    stats = validation['stats']
+    print(f"  Features: {stats.get('total_features', 0)} "
+          f"({stats.get('closed_polygons', 0)} closed, {stats.get('open_segments', 0)} open)")
+    print(f"  Vertices: {stats.get('total_vertices', 0)}")
+    if stats.get('largest_polygon_km2', 0) > 0:
+        print(f"  Largest polygon: {stats['largest_polygon_km2']:.1f} km²")
+
     if terrain:
         print(f"  Terrain: {terrain['rows']}x{terrain['cols']} grid, "
               f"cell size {terrain['cell_size']:.1f}m")
+
+    # Quality warnings
+    if validation['warnings']:
+        print()
+        print("Quality warnings:")
+        for w in validation['warnings']:
+            print(f"  ⚠ {w}")
+
+    # Final status
+    if validation['valid'] and not validation['warnings']:
+        print(f"\n✓ Data quality: GOOD (ready for simulation)")
+    elif validation['valid']:
+        print(f"\n⚠ Data quality: ACCEPTABLE (check warnings)")
+    else:
+        print(f"\n✗ Data quality: ISSUES DETECTED")
 
 
 if __name__ == "__main__":
