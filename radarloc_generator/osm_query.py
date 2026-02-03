@@ -6,6 +6,95 @@ from .coordinate_transform import latlon_to_xy
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 
+def find_water_coordinates(location_name: str) -> dict:
+    """Find the center coordinates of a water body by name.
+
+    Uses Nominatim to search for water features matching the location name.
+    More reliable than Overpass for name-based searches.
+
+    Args:
+        location_name: Name of the water body (e.g., "Lake Murray", "San Francisco Bay")
+
+    Returns:
+        Dict with 'lat', 'lon', 'name', 'area_km2' or None if not found.
+    """
+    NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+    headers = {
+        "User-Agent": "MarineRadarLocationGenerator/1.0"
+    }
+
+    # Search for water features
+    params = {
+        "q": location_name,
+        "format": "json",
+        "limit": 20,
+        "extratags": 1,
+        "namedetails": 1,
+    }
+
+    try:
+        resp = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        results = resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+    # Filter for water-related features
+    water_types = ["water", "lake", "reservoir", "bay", "lagoon", "pond",
+                   "river", "stream", "canal", "coastline", "sea", "ocean"]
+
+    water_features = []
+    for r in results:
+        feature_type = r.get("type", "").lower()
+        feature_class = r.get("class", "").lower()
+
+        # Check if it's a water feature
+        is_water = (
+            feature_type in water_types or
+            feature_class in ["natural", "water", "waterway"] or
+            "lake" in r.get("display_name", "").lower() or
+            "bay" in r.get("display_name", "").lower() or
+            "reservoir" in r.get("display_name", "").lower()
+        )
+
+        if not is_water:
+            continue
+
+        # Get bounding box for area estimate
+        bbox = r.get("boundingbox", [])
+        if len(bbox) == 4:
+            lat_range = float(bbox[1]) - float(bbox[0])
+            lon_range = float(bbox[3]) - float(bbox[2])
+            center_lat = (float(bbox[0]) + float(bbox[1])) / 2
+            area_km2 = lat_range * 111 * lon_range * 111 * math.cos(math.radians(center_lat))
+        else:
+            area_km2 = 0
+
+        water_features.append({
+            "name": r.get("display_name", "").split(",")[0],
+            "full_name": r.get("display_name", ""),
+            "lat": float(r.get("lat", 0)),
+            "lon": float(r.get("lon", 0)),
+            "area_km2": area_km2,
+            "type": feature_type,
+            "osm_id": r.get("osm_id", "")
+        })
+
+    if not water_features:
+        return {"error": f"No water features found matching '{location_name}'"}
+
+    # Return the largest water feature
+    largest = max(water_features, key=lambda x: x["area_km2"])
+    return {
+        "lat": round(largest["lat"], 6),
+        "lon": round(largest["lon"], 6),
+        "name": largest["name"],
+        "area_km2": round(largest["area_km2"], 2),
+        "all_matches": water_features
+    }
+
+
 def _douglas_peucker(points: list, epsilon: float) -> list:
     """Simplify a polyline using the Douglas-Peucker algorithm.
 
