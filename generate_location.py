@@ -78,6 +78,9 @@ def main():
     if not output:
         safe_name = re.sub(r"[^\w\-]", "_", args.location.split(",")[0].strip().lower())
         output = f"{safe_name}.radarloc"
+    elif not output.lower().endswith('.radarloc'):
+        # Ensure .radarloc extension is added
+        output = f"{output}.radarloc"
 
     # Validate before saving
     validation = validate_radarloc(doc)
