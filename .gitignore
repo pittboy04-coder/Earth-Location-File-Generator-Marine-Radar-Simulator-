@@ -10,3 +10,7 @@ build/
 .env
 .venv/
 venv/
+.overpass_cache/
+
+*.bak_*
+.overpass_cache/

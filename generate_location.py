@@ -16,12 +16,95 @@ from radarloc_generator.elevation import query_elevation_grid
 from radarloc_generator.radarloc_builder import build_radarloc, save_radarloc, validate_radarloc
 
 
+NAVIGABLE_REPOSITION_CLASSES = {
+    "water",
+    "river",
+    "shoreline",
+    "coastline",
+    "harbour",
+    "harbor",
+    "bay",
+    "strait",
+    "fairway",
+    "canal",
+    "stream",
+    "dock",
+}
+
+
 def parse_coordinates(text: str):
     """Try to parse 'lat,lon' from text. Returns (lat, lon) or None."""
     m = re.match(r"^\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*$", text)
     if m:
         return float(m.group(1)), float(m.group(2))
     return None
+
+
+def _distance_point_to_segment_projection(px, py, ax, ay, bx, by):
+    dx = bx - ax
+    dy = by - ay
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return math.hypot(px - ax, py - ay), ax, ay
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    qx = ax + t * dx
+    qy = ay + t * dy
+    return math.hypot(px - qx, py - qy), qx, qy
+
+
+def _polygon_area_xy(points):
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _point_in_polygon_xy(px, py, points):
+    inside = False
+    j = len(points) - 1
+    for i in range(len(points)):
+        xi, yi = points[i]
+        xj, yj = points[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _feature_is_navigable_candidate(feat):
+    feature_class = str(feat.get("feature_class", "") or "").strip().lower()
+    if feature_class not in NAVIGABLE_REPOSITION_CLASSES:
+        return False
+    points = feat.get("points", [])
+    if len(points) < 2:
+        return False
+    if feat.get("closed", False) and feature_class in {"water", "river", "shoreline", "harbour", "harbor", "bay", "strait"}:
+        coords = [
+            (float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1]))
+            for p in points
+        ]
+        if _polygon_area_xy(coords) < 8_000.0:
+            return False
+    return True
+
+
+def _origin_inside_closed_water(coastlines):
+    for feat in coastlines:
+        if not feat.get("closed", False):
+            continue
+        if not _feature_is_navigable_candidate(feat):
+            continue
+        coords = [
+            (float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1]))
+            for p in feat.get("points", [])
+        ]
+        if len(coords) >= 3 and _point_in_polygon_xy(0.0, 0.0, coords):
+            return True
+    return False
 
 
 def find_nearest_coastline_point(coastlines, center_lat, center_lon):
@@ -35,27 +118,36 @@ def find_nearest_coastline_point(coastlines, center_lat, center_lon):
         (nearest_x, nearest_y, nearest_dist, feature_name) in local meters,
         or None if no coastlines.
     """
-    nearest = None
-    min_dist = float('inf')
-    feat_name = ""
+    def _nearest_from_features(features):
+        nearest = None
+        min_dist = float('inf')
+        feat_name = ""
+        for feat in features:
+            pts = feat.get("points", [])
+            if len(pts) < 2:
+                continue
+            name = feat.get("name", "")
+            for i in range(len(pts) - 1):
+                if isinstance(pts[i], dict):
+                    ax, ay = float(pts[i]["x"]), float(pts[i]["y"])
+                    bx, by = float(pts[i + 1]["x"]), float(pts[i + 1]["y"])
+                else:
+                    ax, ay = float(pts[i][0]), float(pts[i][1])
+                    bx, by = float(pts[i + 1][0]), float(pts[i + 1][1])
+                d, qx, qy = _distance_point_to_segment_projection(0.0, 0.0, ax, ay, bx, by)
+                if d < min_dist:
+                    min_dist = d
+                    nearest = (qx, qy)
+                    feat_name = name
+        if nearest is None:
+            return None
+        return nearest[0], nearest[1], min_dist, feat_name
 
-    for feat in coastlines:
-        pts = feat.get("points", [])
-        name = feat.get("name", "")
-        for p in pts:
-            if isinstance(p, dict):
-                x, y = p["x"], p["y"]
-            else:
-                x, y = p[0], p[1]
-            d = math.sqrt(x * x + y * y)
-            if d < min_dist:
-                min_dist = d
-                nearest = (x, y)
-                feat_name = name
-
-    if nearest is None:
-        return None
-    return nearest[0], nearest[1], min_dist, feat_name
+    navigable = [feat for feat in coastlines if _feature_is_navigable_candidate(feat)]
+    result = _nearest_from_features(navigable)
+    if result is not None:
+        return result
+    return _nearest_from_features(coastlines)
 
 
 def reposition_near_coastline(coastlines, center_lat, center_lon,
@@ -176,17 +268,28 @@ def main():
         new_lat, new_lon, off_x, off_y, nearest_dist = reposition_near_coastline(
             coastlines, lat, lon, radar_range_m, coast_fraction=0.6)
 
+        requery_lat, requery_lon = new_lat, new_lon
         if off_x != 0 or off_y != 0:
-            # Re-query at the new center with tighter range
-            print(f"  Re-querying water features at new center "
-                  f"(radius {capture_range_m:.0f}m)...")
-            try:
-                coastlines = query_water_features(
-                    new_lat, new_lon, capture_range_m,
-                    simplify_epsilon=2.0)  # Fine detail for short range
-            except Exception as e:
-                print(f"  Warning: Re-query failed: {e}", file=sys.stderr)
-                # Fall back to shifting the original features
+            lat, lon = new_lat, new_lon
+            location_name = f"{location_name} (maritime-repositioned)"
+        else:
+            print(f"  No repositioning needed -- coastline already nearby")
+
+        # Always do a tight harbor-detail re-query for maritime exports. This
+        # keeps near-range harbor coves, tributaries, and tidal inlets crisp
+        # even when the original center was already close to shore.
+        print(f"  Re-querying water features at final center "
+              f"(radius {capture_range_m:.0f}m, harbor detail)...")
+        try:
+            coastlines = query_water_features(
+                requery_lat, requery_lon, capture_range_m,
+                simplify_epsilon=0.0,
+                detail_profile="harbor_tidal")
+        except Exception as e:
+            print(f"  Warning: Re-query failed: {e}", file=sys.stderr)
+            if off_x != 0 or off_y != 0:
+                # Fall back to shifting the original features if the center
+                # changed but the detailed re-query could not complete.
                 for feat in coastlines:
                     pts = feat.get("points", [])
                     feat["points"] = [
@@ -197,15 +300,26 @@ def main():
                          "y": round(p[1] - off_y, 1)}
                         for p in pts
                     ]
+            # If we were already near shore and the re-query fails, keep the
+            # original wide query instead of aborting the export.
 
-            lat, lon = new_lat, new_lon
-            final_range_nm = capture_range_nm
-            location_name = f"{location_name} (maritime-repositioned)"
-            print(f"  Final features: {len(coastlines)}")
-        else:
-            print(f"  No repositioning needed -- coastline already nearby")
-            # Still tighten the range for Mode 12 compatibility
-            final_range_nm = capture_range_nm
+        lat, lon = requery_lat, requery_lon
+        if coastlines and not _origin_inside_closed_water(coastlines):
+            print(f"  Fine-tuning center into mapped water...")
+            tuned_lat, tuned_lon, tuned_off_x, tuned_off_y, _ = reposition_near_coastline(
+                coastlines, lat, lon, radar_range_m, coast_fraction=0.35)
+            if tuned_off_x != 0.0 or tuned_off_y != 0.0:
+                try:
+                    coastlines = query_water_features(
+                        tuned_lat, tuned_lon, capture_range_m,
+                        simplify_epsilon=0.0,
+                        detail_profile="harbor_tidal")
+                    lat, lon = tuned_lat, tuned_lon
+                    print(f"  Water-tuned center: ({lat:.6f}, {lon:.6f})")
+                except Exception as e:
+                    print(f"  Warning: Water-tune re-query failed: {e}", file=sys.stderr)
+        final_range_nm = capture_range_nm
+        print(f"  Final features: {len(coastlines)}")
 
     elif args.maritime and not coastlines:
         print("\nWARNING: --maritime flag set but no coastlines found at this "
